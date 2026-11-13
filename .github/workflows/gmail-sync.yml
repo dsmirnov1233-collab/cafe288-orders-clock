@@ -1,0 +1,58 @@
+name: Cafe 288 free Gmail check
+on:
+  schedule:
+    - cron: '3-58/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      renew_watch:
+        description: 'Safely verify Gmail Watch renewal (no order changes)'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths: ['.github/workflows/gmail-sync.yml']
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: cafe288-gmail-check
+  cancel-in-progress: false
+jobs:
+  sync:
+    if: github.repository == 'dsmirnov1233-collab/cafe288-orders-clock' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Call existing app with short-lived GitHub OIDC
+        shell: bash
+        env:
+          VERIFY_WATCH: ${{ inputs.renew_watch || false }}
+        run: |
+          node --input-type=module <<'JS'
+          const origin = 'https://cafe288-orders-pwa.sizeddolphin4.chatgpt.site';
+          const tokenUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          tokenUrl.searchParams.set('audience', origin);
+          const identity = await fetch(tokenUrl, {headers: {Authorization: 'Bearer ' + process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}, redirect: 'manual', signal: AbortSignal.timeout(20000)});
+          if (!identity.ok) throw new Error('GitHub OIDC request failed: HTTP ' + identity.status);
+          const token = (await identity.json()).value;
+          if (typeof token !== 'string') throw new Error('No OIDC token');
+          const deadline = Date.now() + 145000;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const remaining = deadline - Date.now();
+            if (remaining < 5000) throw new Error('Background check time budget exhausted');
+            let response;
+            try {
+              response = await fetch(origin + '/background/tick', {method: 'POST', headers: {Authorization: 'Bearer ' + token, 'Content-Type': 'application/json'}, body: JSON.stringify({renewWatch: process.env.VERIFY_WATCH === 'true'}), redirect: 'manual', signal: AbortSignal.timeout(Math.min(90000, remaining))});
+            } catch {
+              if (attempt === 2) throw new Error('Background server unreachable; next scheduled run will retry');
+            }
+            const result = response ? await response.json().catch(() => ({})) : {};
+            console.log(JSON.stringify({attempt: attempt + 1, http: response?.status ?? null, ok: !!result.ok, busy: !!result.busy, paused: !!result.paused, pending: result.pendingCount ?? null, watchExpires: result.watchExpires ?? null}));
+            if (response?.ok && result.ok) break;
+            if (result.paused) throw new Error('Gmail check paused; next scheduled run will retry');
+            if (response && !result.busy && response.status !== 429 && response.status < 500) throw new Error('Background check rejected: HTTP ' + response.status);
+            if (attempt === 2) throw new Error('Background check unavailable after bounded retries');
+            await new Promise(resolve => setTimeout(resolve, 5000 * (attempt + 1)));
+          }
+          JS
